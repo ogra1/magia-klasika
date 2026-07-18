@@ -24,7 +24,7 @@ apps:
   # install time; enabled+started by the configure hook once config is valid.
   reconcile:
     command: bin/lxd-wrapper
-    daemon: oneshot
+    daemon: simple
     install-mode: disable
     start-timeout: 900s
     restart-condition: on-failure

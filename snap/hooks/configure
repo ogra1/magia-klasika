@@ -9,7 +9,7 @@
 set -eu
 
 err() {
-    echo "error: $*" >&2
+    logger "error: $*" >&2
 }
 
 RECONCILE_SVC="reconcile"
@@ -139,8 +139,8 @@ validate_positive_int() {
 # service control helpers
 # ---------------------------------------------------------------------------
 enable_reconcile() {
-    if ! snapctl start --enable "$RECONCILE_SVC" 2>/dev/null; then
-        snapctl restart "$RECONCILE_SVC" 2>/dev/null || \
+    if ! snapctl start "$SNAP_NAME.$RECONCILE_SVC" 2>/dev/null; then
+        snapctl restart "$SNAP_NAME.$RECONCILE_SVC" 2>/dev/null || \
             err "warning: could not start ${RECONCILE_SVC} service."
     fi
 }
