@@ -195,26 +195,80 @@ create_default_pool() {
         return 0
     fi
 
-    local driver body resp sc
+    local driver
     driver="$(detect_storage_driver)"
     log "Creating storage pool '${DEFAULT_POOL}' (driver: ${driver}) ..."
 
-    body="$(jq -n --arg name "$DEFAULT_POOL" --arg drv "$driver" \
-        '{name:$name, driver:$drv}')"
-    resp="$(lxd_api POST "/1.0/storage-pools" "$body")"
-    sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+    if _try_create_pool "$driver"; then
+        log "Storage pool '${DEFAULT_POOL}' ready (driver: ${driver})."
+        return 0
+    fi
 
-    if [ "$sc" != "200" ] && [ "$sc" != "0" ] && [ "$driver" != "dir" ]; then
+    # Fall back to 'dir' if a CoW backend failed.
+    if [ "$driver" != "dir" ]; then
         log "Driver '${driver}' failed; falling back to 'dir'."
-        body="$(jq -n --arg name "$DEFAULT_POOL" '{name:$name, driver:"dir"}')"
-        resp="$(lxd_api POST "/1.0/storage-pools" "$body")"
-        sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+        if _try_create_pool "dir"; then
+            log "Storage pool '${DEFAULT_POOL}' ready (driver: dir)."
+            return 0
+        fi
     fi
 
-    if [ "$sc" != "200" ] && [ "$sc" != "0" ]; then
-        die "Failed to create storage pool: $(echo "$resp" | jq -c '.error // .')"
+    die "Failed to create storage pool '${DEFAULT_POOL}'. See errors above."
+}
+
+# Attempt to create the pool with a given driver.
+# Returns 0 on success, 1 on failure (and logs why).
+_try_create_pool() {
+    local drv="$1" body resp rtype scode ecode
+
+    body="$(jq -n --arg name "$DEFAULT_POOL" --arg drv "$drv" \
+        '{name:$name, driver:$drv}')"
+
+    resp="$(lxd_api POST "/1.0/storage-pools" "$body")"
+
+    # 1) Empty response == curl/socket failure.
+    if [ -z "$resp" ]; then
+        err "Empty response creating pool (driver ${drv}); LXD socket/API unreachable?"
+        return 1
     fi
-    log "Storage pool '${DEFAULT_POOL}' ready."
+
+    # 2) Response must be valid JSON.
+    if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
+        err "Non-JSON response creating pool (driver ${drv}): $resp"
+        return 1
+    fi
+
+    rtype="$(echo "$resp" | jq -r '.type // empty')"
+    scode="$(echo "$resp" | jq -r '.status_code // empty')"
+    ecode="$(echo "$resp" | jq -r '.error_code // empty')"
+
+    case "$rtype" in
+        error)
+            err "LXD error creating pool (driver ${drv}, code ${ecode}): \
+$(echo "$resp" | jq -r '.error // "unknown"')"
+            return 1
+            ;;
+        async)
+            # Wait for the background operation and check its result.
+            if wait_for_operation "$resp"; then
+                return 0
+            fi
+            err "Async pool creation failed (driver ${drv})."
+            return 1
+            ;;
+        sync)
+            if [ "$scode" = "200" ]; then
+                return 0
+            fi
+            err "Unexpected sync status ${scode} creating pool (driver ${drv}): \
+$(echo "$resp" | jq -c '.error // .')"
+            return 1
+            ;;
+        *)
+            err "Unknown response type '${rtype}' creating pool (driver ${drv}): $resp"
+            return 1
+            ;;
+    esac
 }
 
 create_default_network() {
