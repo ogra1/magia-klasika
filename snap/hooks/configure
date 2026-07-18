@@ -1,70 +1,143 @@
-#!/bin/bash
-#
-# configure hook
+#!/bin/sh
 #
 # Validates configuration and drives the reconcile oneshot service:
 #   - valid config with snap-name set  -> enable + (re)start reconcile
 #   - snap-name unset                  -> stop + disable reconcile
 #
-set -euo pipefail
+# Rejecting (exit non-zero) causes snapd to keep the previous configuration.
+#
+set -eu
 
-err() { echo "error: $*" >&2; }
+err() {
+    echo "error: $*" >&2
+}
 
 RECONCILE_SVC="reconcile"
 
+# ---------------------------------------------------------------------------
+# snap-name validation
+# ---------------------------------------------------------------------------
+# Rules: lowercase letters, digits, single hyphens; >=1 letter; no leading/
+# trailing hyphen; length 1..40.
 validate_snap_name() {
-    local name="$1"
-    if [ "${#name}" -gt 40 ]; then
-        err "snap-name '$name' is too long (max 40 characters)."; return 1
+    vsn_name="$1"
+
+    if [ "${#vsn_name}" -gt 40 ]; then
+        err "snap-name '$vsn_name' is too long (max 40 characters)."
+        return 1
     fi
-    if ! echo "$name" | grep -Eq '^[a-z0-9](-?[a-z0-9])*$'; then
-        err "snap-name '$name' is invalid. Names must use lowercase letters,
+
+    if ! printf '%s' "$vsn_name" | grep -Eq '^[a-z0-9](-?[a-z0-9])*$'; then
+        err "snap-name '$vsn_name' is invalid. Names must use lowercase letters,
        digits and single hyphens, and may not start or end with a hyphen."
         return 1
     fi
-    if ! echo "$name" | grep -Eq '[a-z]'; then
-        err "snap-name '$name' must contain at least one letter."; return 1
-    fi
-    return 0
-}
 
-validate_channel() {
-    local channel="$1"
-    local risks="stable candidate beta edge"
-    IFS='/' read -r p1 p2 p3 extra <<< "$channel"
-    if [ -n "${extra:-}" ]; then
-        err "channel '$channel' has too many components (expected track/risk/branch)."
+    if ! printf '%s' "$vsn_name" | grep -Eq '[a-z]'; then
+        err "snap-name '$vsn_name' must contain at least one letter."
         return 1
     fi
-    is_risk() { local c="$1" r; for r in $risks; do [ "$c" = "$r" ] && return 0; done; return 1; }
-    valid_token() { echo "$1" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$'; }
-    case "$channel" in
-        */*/*)
-            valid_token "$p1" || { err "channel track '$p1' is invalid."; return 1; }
-            is_risk "$p2"     || { err "channel risk '$p2' must be one of: $risks."; return 1; }
-            valid_token "$p3" || { err "channel branch '$p3' is invalid."; return 1; }
-            ;;
-        */*)
-            valid_token "$p1" || { err "channel track '$p1' is invalid."; return 1; }
-            is_risk "$p2"     || { err "channel risk '$p2' must be one of: $risks."; return 1; }
-            ;;
-        *)
-            if is_risk "$channel"; then :;
-            elif valid_token "$channel"; then :;
-            else err "channel '$channel' is invalid."; return 1; fi
-            ;;
-    esac
+
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# helpers for channel validation
+# ---------------------------------------------------------------------------
+# is_risk <token>  -> 0 if token is a known risk level
+is_risk() {
+    case "$1" in
+        stable|candidate|beta|edge) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# valid_token <token> -> 0 if token is a valid track/branch token
+valid_token() {
+    printf '%s' "$1" | grep -Eq '^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$'
+}
+
+# ---------------------------------------------------------------------------
+# channel validation:  [track/]risk[/branch]
+# ---------------------------------------------------------------------------
+# POSIX parameter expansion is used to split on "/" without arrays or
+# here-strings.
+validate_channel() {
+    vc_channel="$1"
+
+    # Count the number of "/" separators by stripping them.
+    vc_slashes="$(printf '%s' "$vc_channel" | tr -cd '/' | wc -c)"
+    vc_slashes="$(printf '%s' "$vc_slashes" | tr -d ' ')"
+
+    case "$vc_slashes" in
+        0)
+            # Single component: either a bare risk or a bare track.
+            if is_risk "$vc_channel"; then
+                return 0
+            elif valid_token "$vc_channel"; then
+                return 0
+            else
+                err "channel '$vc_channel' is invalid."
+                return 1
+            fi
+            ;;
+        1)
+            # track/risk
+            vc_p1="${vc_channel%%/*}"
+            vc_p2="${vc_channel#*/}"
+            if ! valid_token "$vc_p1"; then
+                err "channel track '$vc_p1' is invalid."
+                return 1
+            fi
+            if ! is_risk "$vc_p2"; then
+                err "channel risk '$vc_p2' must be one of: stable candidate beta edge."
+                return 1
+            fi
+            return 0
+            ;;
+        2)
+            # track/risk/branch
+            vc_p1="${vc_channel%%/*}"           # track
+            vc_rest="${vc_channel#*/}"          # risk/branch
+            vc_p2="${vc_rest%%/*}"              # risk
+            vc_p3="${vc_rest#*/}"              # branch
+            if ! valid_token "$vc_p1"; then
+                err "channel track '$vc_p1' is invalid."
+                return 1
+            fi
+            if ! is_risk "$vc_p2"; then
+                err "channel risk '$vc_p2' must be one of: stable candidate beta edge."
+                return 1
+            fi
+            if ! valid_token "$vc_p3"; then
+                err "channel branch '$vc_p3' is invalid."
+                return 1
+            fi
+            return 0
+            ;;
+        *)
+            err "channel '$vc_channel' has too many components (expected track/risk/branch)."
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# positive-integer validation
+# ---------------------------------------------------------------------------
 validate_positive_int() {
-    local key="$1" val="$2"
-    if ! echo "$val" | grep -Eq '^[1-9][0-9]*$'; then
-        err "$key must be a positive integer (got '$val')."; return 1
+    vpi_key="$1"
+    vpi_val="$2"
+    if ! printf '%s' "$vpi_val" | grep -Eq '^[1-9][0-9]*$'; then
+        err "$vpi_key must be a positive integer (got '$vpi_val')."
+        return 1
     fi
     return 0
 }
 
+# ---------------------------------------------------------------------------
+# service control helpers
+# ---------------------------------------------------------------------------
 enable_reconcile() {
     if ! snapctl start --enable "$RECONCILE_SVC" 2>/dev/null; then
         snapctl restart "$RECONCILE_SVC" 2>/dev/null || \
@@ -76,32 +149,56 @@ disable_reconcile() {
     snapctl stop --disable "$RECONCILE_SVC" 2>/dev/null || true
 }
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 main() {
-    local snap_name channel max_attempts base_delay max_delay
-
     snap_name="$(snapctl get snap-name || true)"
     channel="$(snapctl get channel || true)"
     max_attempts="$(snapctl get install-max-attempts || true)"
     base_delay="$(snapctl get install-base-delay || true)"
     max_delay="$(snapctl get install-max-delay || true)"
 
+    # Validate any values that are set.
     if [ -n "$snap_name" ]; then
-        validate_snap_name "$snap_name" || { err "Rejecting configuration change."; exit 1; }
+        if ! validate_snap_name "$snap_name"; then
+            err "Rejecting configuration change."
+            exit 1
+        fi
     fi
+
     if [ -n "$channel" ]; then
-        validate_channel "$channel" || { err "Rejecting configuration change."; exit 1; }
+        if ! validate_channel "$channel"; then
+            err "Rejecting configuration change."
+            exit 1
+        fi
     fi
+
     if [ -n "$max_attempts" ]; then
-        validate_positive_int "install-max-attempts" "$max_attempts" || { err "Rejecting configuration change."; exit 1; }
+        if ! validate_positive_int "install-max-attempts" "$max_attempts"; then
+            err "Rejecting configuration change."
+            exit 1
+        fi
     fi
+
     if [ -n "$base_delay" ]; then
-        validate_positive_int "install-base-delay" "$base_delay" || { err "Rejecting configuration change."; exit 1; }
+        if ! validate_positive_int "install-base-delay" "$base_delay"; then
+            err "Rejecting configuration change."
+            exit 1
+        fi
     fi
+
     if [ -n "$max_delay" ]; then
-        validate_positive_int "install-max-delay" "$max_delay" || { err "Rejecting configuration change."; exit 1; }
+        if ! validate_positive_int "install-max-delay" "$max_delay"; then
+            err "Rejecting configuration change."
+            exit 1
+        fi
     fi
+
+    # Cross-field sanity: base delay must not exceed max delay.
     if [ -n "$base_delay" ] || [ -n "$max_delay" ]; then
-        local eff_base="${base_delay:-3}" eff_max="${max_delay:-60}"
+        eff_base="${base_delay:-3}"
+        eff_max="${max_delay:-60}"
         if [ "$eff_base" -gt "$eff_max" ]; then
             err "install-base-delay ($eff_base) must not exceed install-max-delay ($eff_max)."
             err "Rejecting configuration change."
@@ -109,6 +206,7 @@ main() {
         fi
     fi
 
+    # Config is valid past this point: drive the service.
     if [ -n "$snap_name" ]; then
         enable_reconcile
     else
