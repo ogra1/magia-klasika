@@ -1,4 +1,4 @@
-iname: magia-klasika
+name: magia-klasika
 title: Magia Klasika
 version: git
 summary: Install a classic snap inside an LXD container
