@@ -8,7 +8,7 @@ The snap talks to the host LXD daemon over the `lxd` snap interface using
 LXD's REST API (via the container's unix socket), so it works under strict
 confinement without needing the `lxc` client binary.
 
-Provisioning runs automatically as a **oneshot service** whenever the
+Provisioning runs automatically as a asynchronous **service** whenever the
 configuration changes, and it is safe to re-run (idempotent).
 
 ---
@@ -41,7 +41,7 @@ The snap ships two apps:
 
 | App                     | Type              | Purpose                                                                 |
 |-------------------------|-------------------|-------------------------------------------------------------------------|
-| `magia-klasika.reconcile` | `daemon: oneshot` | Runs automatically when config changes and at boot; performs the work. |
+| `magia-klasika.reconcile` | `daemon` | Runs automatically when config changes; performs the work. |
 | `magia-klasika.run`       | command           | On-demand manual trigger of the same logic.                            |
 
 The `reconcile` service is **disabled at install time** (`install-mode:
@@ -187,7 +187,7 @@ sudo journalctl -u snap.magia-klasika.reconcile -f
 snap services magia-klasika
 ```
 
-> A `oneshot` service shows `inactive` after it completes successfully —
+> The service shows `inactive` after it completes successfully —
 > that is normal; it ran to completion.
 
 The container is named `magia-klasika-container` and is **reused** on
@@ -309,7 +309,7 @@ sudo snap remove magia-klasika
 ```
 magia-klasika/
 ├── snap/
-│   ├── snapcraft.yaml        # metadata, reconcile (oneshot) + run apps, hook
+│   ├── snapcraft.yaml        # metadata, reconcile + run apps, hook
 │   └── hooks/
 │       └── configure         # validates config + controls reconcile service
 ├── bin/
@@ -324,7 +324,7 @@ magia-klasika/
 - Confinement is **strict**; LXD access is granted solely through the
   `lxd` interface (manually connected unless a store declaration auto-connects
   it).
-- The `reconcile` service is a `oneshot` daemon: it runs to completion rather
+- The `reconcile` service is a daemon: that runs to completion rather
   than staying resident.
 - Runs are guarded by a lock file in `$SNAP_COMMON`, so concurrent
   invocations are serialized; a contending run exits successfully as a no-op.
