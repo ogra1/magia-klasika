@@ -40,7 +40,7 @@ STORE_HOST="api.snapcraft.io"
 LOCK_FILE="${SNAP_COMMON:-/tmp}/.lxd-wrapper.lock"
 
 # curl hard timeout for individual API calls (seconds).
-CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-60}"
 
 # Retry tunables (overridable via snap set; see read_config).
 SNAP_INSTALL_MAX_ATTEMPTS="${SNAP_INSTALL_MAX_ATTEMPTS:-5}"
