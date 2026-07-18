@@ -1,0 +1,63 @@
+iname: magia-klasika
+title: Magia Klasika
+version: git
+summary: Install a classic snap inside an LXD container
+description: |
+  Provisions an LXD container running the latest Ubuntu LTS and installs a
+  user-configured classic snap inside it. Runs automatically as a oneshot
+  service whenever the configuration changes.
+
+  Configure with:
+    snap set magia-klasika snap-name=<name>
+    snap set magia-klasika channel=<channel>   # optional
+license: GPL-3.0
+contact: ogra@ubuntu.com
+source-code: https://github.com/ogra1/magia-klasika
+
+base: core24
+grade: stable
+confinement: strict
+adopt-info: wrapper
+
+apps:
+  # Oneshot service: performs the actual provisioning/install. Disabled at
+  # install time; enabled+started by the configure hook once config is valid.
+  reconcile:
+    command: bin/lxd-wrapper
+    daemon: oneshot
+    install-mode: disable
+    start-timeout: 900s
+    restart-condition: on-failure
+    restart-delay: 30s
+    plugs:
+      - lxd
+      - network
+
+  # Manual entry point (optional): lets a user trigger a run on demand,
+  # e.g. `magia-klasika.run`. Shares the same wrapper.
+  run:
+    command: bin/lxd-wrapper
+    plugs:
+      - lxd
+      - network
+
+hooks:
+  configure:
+    plugs:
+      - network
+
+parts:
+  wrapper:
+    plugin: dump
+    source: ./bin
+    organize:
+      lxd-wrapper: bin/lxd-wrapper
+    permissions:
+      - path: bin/lxd-wrapper
+        mode: "755"
+    stage-packages:
+      - jq
+      - curl
+    override-pull: |
+      craftctl default
+      craftctl set version="$(git -C "$CRAFT_PART_SRC/.." describe --tags --always 2>/dev/null || echo 0.1)"

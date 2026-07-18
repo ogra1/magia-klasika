@@ -1,0 +1,594 @@
+#!/bin/bash
+#
+# lxd-wrapper
+#
+# Runs inside a strict snap, either as the `reconcile` oneshot daemon or the
+# on-demand `run` app. Talks to the host LXD daemon over the `lxd` snap
+# interface unix socket (via the REST API with curl), ensures LXD is
+# initialized, creates an Ubuntu LTS container, and installs a
+# user-configured classic snap inside it.
+#
+# Configuration (via `snap set`):
+#   snap-name              (required) classic snap to install
+#   channel                (optional) channel; default "stable"
+#   install-max-attempts   (optional) retry attempts; default 5
+#   install-base-delay     (optional) initial backoff seconds; default 3
+#   install-max-delay      (optional) backoff cap seconds; default 60
+#
+set -euo pipefail
+
+# ===========================================================================
+# Configuration / constants
+# ===========================================================================
+
+LXD_SOCKET="${LXD_SOCKET:-/var/snap/lxd/common/lxd/unix.socket}"
+
+CONTAINER_NAME="${SNAP_INSTANCE_NAME:-magia-klasika}-container"
+CONTAINER_NAME="$(echo "$CONTAINER_NAME" | tr '[:upper:]_' '[:lower:]-')"
+
+UBUNTU_LTS_ALIAS="24.04"
+IMAGE_REMOTE="ubuntu"
+IMAGE_SERVER="https://cloud-images.ubuntu.com/releases"
+
+DEFAULT_POOL="default"
+DEFAULT_NETWORK="lxdbr0"
+DEFAULT_PROFILE="default"
+
+STORE_HOST="api.snapcraft.io"
+
+# Concurrency lock (persists in the snap's common dir).
+LOCK_FILE="${SNAP_COMMON:-/tmp}/.lxd-wrapper.lock"
+
+# curl hard timeout for individual API calls (seconds).
+CURL_MAX_TIME="${CURL_MAX_TIME:-30}"
+
+# Retry tunables (overridable via snap set; see read_config).
+SNAP_INSTALL_MAX_ATTEMPTS="${SNAP_INSTALL_MAX_ATTEMPTS:-5}"
+SNAP_INSTALL_BASE_DELAY="${SNAP_INSTALL_BASE_DELAY:-3}"
+SNAP_INSTALL_MAX_DELAY="${SNAP_INSTALL_MAX_DELAY:-60}"
+
+LAST_INSTALL_OUTPUT=""
+
+# ===========================================================================
+# Logging helpers (journald-friendly: progress -> stdout, errors -> stderr)
+# ===========================================================================
+
+log() { echo "[lxd-wrapper] $*"; }
+err() { echo "[lxd-wrapper] ERROR: $*" >&2; }
+die() { err "$*"; exit 1; }
+
+# ===========================================================================
+# Concurrency lock
+# ===========================================================================
+#
+# Prevents the manual `run` app and the `reconcile` service (or two service
+# restarts) from racing on container creation. On contention we exit 0 so
+# the oneshot service is not marked failed — the other instance is handling
+# reconciliation.
+
+acquire_lock() {
+    exec 9>"$LOCK_FILE"
+    if ! flock -n 9; then
+        log "Another lxd-wrapper instance is running; exiting."
+        exit 0
+    fi
+}
+
+# ===========================================================================
+# LXD REST API helpers (over the unix socket)
+# ===========================================================================
+
+require_socket() {
+    if [ ! -S "$LXD_SOCKET" ]; then
+        die "LXD socket not found at $LXD_SOCKET.
+Is the lxd snap installed and the interface connected?
+  sudo snap install lxd
+  sudo snap connect ${SNAP_INSTANCE_NAME:-magia-klasika}:lxd lxd:lxd"
+    fi
+}
+
+# lxd_api <METHOD> <PATH> [JSON_BODY]
+lxd_api() {
+    local method="$1" path="$2" body="${3:-}"
+    if [ -n "$body" ]; then
+        curl -sS --max-time "$CURL_MAX_TIME" --unix-socket "$LXD_SOCKET" \
+            -X "$method" \
+            -H "Content-Type: application/json" \
+            --data "$body" \
+            "http://lxd${path}"
+    else
+        curl -sS --max-time "$CURL_MAX_TIME" --unix-socket "$LXD_SOCKET" \
+            -X "$method" \
+            "http://lxd${path}"
+    fi
+}
+
+# HTTP status code for a GET on a path (existence checks).
+http_code() {
+    curl -sS --max-time "$CURL_MAX_TIME" -o /dev/null -w '%{http_code}' \
+        --unix-socket "$LXD_SOCKET" "http://lxd${1}"
+}
+
+# Wait for an async LXD operation to finish, given the create/action response.
+wait_for_operation() {
+    local response="$1"
+    local op_type
+    op_type="$(echo "$response" | jq -r '.type // empty')"
+    [ "$op_type" = "async" ] || return 0
+
+    local op_path
+    op_path="$(echo "$response" | jq -r '.operation')"
+    [ -n "$op_path" ] && [ "$op_path" != "null" ] || return 0
+
+    log "Waiting for operation ${op_path##*/} ..."
+    local result status
+    result="$(lxd_api GET "${op_path}/wait")"
+    status="$(echo "$result" | jq -r '.metadata.status // .status')"
+    if [ "$status" != "Success" ]; then
+        err "Operation failed: $(echo "$result" | jq -r '.metadata.err // .error // "unknown"')"
+        return 1
+    fi
+    return 0
+}
+
+# ===========================================================================
+# Configuration (snapctl)
+# ===========================================================================
+
+read_config() {
+    SNAP_NAME="$(snapctl get snap-name || true)"
+    SNAP_CHANNEL="$(snapctl get channel || true)"
+    [ -n "$SNAP_CHANNEL" ] || SNAP_CHANNEL="stable"
+
+    if [ -z "$SNAP_NAME" ]; then
+        die "No snap configured. Set one with:
+  snap set ${SNAP_INSTANCE_NAME:-magia-klasika} snap-name=<name>
+Optionally set a channel:
+  snap set ${SNAP_INSTANCE_NAME:-magia-klasika} channel=<channel>"
+    fi
+
+    local v
+    v="$(snapctl get install-max-attempts || true)"; [ -n "$v" ] && SNAP_INSTALL_MAX_ATTEMPTS="$v"
+    v="$(snapctl get install-base-delay   || true)"; [ -n "$v" ] && SNAP_INSTALL_BASE_DELAY="$v"
+    v="$(snapctl get install-max-delay    || true)"; [ -n "$v" ] && SNAP_INSTALL_MAX_DELAY="$v"
+
+    log "Configured snap : $SNAP_NAME"
+    log "Configured chan.: $SNAP_CHANNEL"
+}
+
+# ===========================================================================
+# LXD initialization (equivalent of `lxd init --auto`)
+# ===========================================================================
+
+lxd_is_initialized() {
+    local profile ok has_root has_nic
+    profile="$(lxd_api GET "/1.0/profiles/${DEFAULT_PROFILE}" 2>/dev/null || true)"
+
+    ok="$(echo "$profile" | jq -r '.status_code // empty' 2>/dev/null || true)"
+    [ "$ok" = "200" ] || return 1
+
+    has_root="$(echo "$profile" | jq -r '
+        [.metadata.devices[]? | select(.type=="disk" and .path=="/")] | length')"
+    [ "$has_root" -ge 1 ] 2>/dev/null || return 1
+
+    has_nic="$(echo "$profile" | jq -r '
+        [.metadata.devices[]? | select(.type=="nic")] | length')"
+    [ "$has_nic" -ge 1 ] 2>/dev/null || return 1
+
+    return 0
+}
+
+detect_storage_driver() {
+    local supported
+    supported="$(lxd_api GET "/1.0" \
+        | jq -r '.metadata.environment.storage_supported_drivers[]?.Name' \
+        2>/dev/null || true)"
+    for driver in zfs btrfs dir; do
+        echo "$supported" | grep -qx "$driver" && { echo "$driver"; return 0; }
+    done
+    echo "dir"
+}
+
+create_default_pool() {
+    if [ "$(http_code "/1.0/storage-pools/${DEFAULT_POOL}")" = "200" ]; then
+        log "Storage pool '${DEFAULT_POOL}' already exists."
+        return 0
+    fi
+
+    local driver body resp sc
+    driver="$(detect_storage_driver)"
+    log "Creating storage pool '${DEFAULT_POOL}' (driver: ${driver}) ..."
+
+    body="$(jq -n --arg name "$DEFAULT_POOL" --arg drv "$driver" \
+        '{name:$name, driver:$drv}')"
+    resp="$(lxd_api POST "/1.0/storage-pools" "$body")"
+    sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+
+    if [ "$sc" != "200" ] && [ "$sc" != "0" ] && [ "$driver" != "dir" ]; then
+        log "Driver '${driver}' failed; falling back to 'dir'."
+        body="$(jq -n --arg name "$DEFAULT_POOL" '{name:$name, driver:"dir"}')"
+        resp="$(lxd_api POST "/1.0/storage-pools" "$body")"
+        sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+    fi
+
+    if [ "$sc" != "200" ] && [ "$sc" != "0" ]; then
+        die "Failed to create storage pool: $(echo "$resp" | jq -c '.error // .')"
+    fi
+    log "Storage pool '${DEFAULT_POOL}' ready."
+}
+
+create_default_network() {
+    if [ "$(http_code "/1.0/networks/${DEFAULT_NETWORK}")" = "200" ]; then
+        log "Network '${DEFAULT_NETWORK}' already exists."
+        return 0
+    fi
+
+    log "Creating managed network '${DEFAULT_NETWORK}' ..."
+    local body resp sc
+    body="$(jq -n --arg name "$DEFAULT_NETWORK" \
+        '{
+            name: $name,
+            type: "bridge",
+            config: {
+                "ipv4.address": "auto",
+                "ipv4.nat": "true",
+                "ipv6.address": "auto",
+                "ipv6.nat": "true"
+            }
+        }')"
+    resp="$(lxd_api POST "/1.0/networks" "$body")"
+    sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+    if [ "$sc" != "200" ] && [ "$sc" != "0" ]; then
+        die "Failed to create network: $(echo "$resp" | jq -c '.error // .')"
+    fi
+    log "Network '${DEFAULT_NETWORK}' ready."
+}
+
+attach_devices_to_profile() {
+    log "Configuring default profile with root disk and network ..."
+    local profile merged resp sc
+    profile="$(lxd_api GET "/1.0/profiles/${DEFAULT_PROFILE}")"
+
+    merged="$(echo "$profile" | jq \
+        --arg net "$DEFAULT_NETWORK" \
+        --arg pool "$DEFAULT_POOL" \
+        '.metadata
+         | {
+             config: (.config // {}),
+             description: (.description // ""),
+             devices: ((.devices // {}) + {
+                 eth0: { name: "eth0", network: $net, type: "nic" },
+                 root: { path: "/", pool: $pool, type: "disk" }
+             })
+           }')"
+
+    resp="$(lxd_api PUT "/1.0/profiles/${DEFAULT_PROFILE}" "$merged")"
+    sc="$(echo "$resp" | jq -r '.status_code // .error_code // 0')"
+    if [ "$sc" != "200" ] && [ "$sc" != "0" ]; then
+        die "Failed to update default profile: $(echo "$resp" | jq -c '.error // .')"
+    fi
+    log "Default profile configured."
+}
+
+wait_for_network_ipv4() {
+    local timeout="${1:-60}"
+    log "Waiting for '${DEFAULT_NETWORK}' to obtain an IPv4 address ..."
+
+    local i state addr
+    for i in $(seq 1 "$timeout"); do
+        state="$(lxd_api GET "/1.0/networks/${DEFAULT_NETWORK}/state" 2>/dev/null || true)"
+        addr="$(echo "$state" | jq -r '
+            .metadata.addresses[]?
+            | select(.family == "inet")
+            | select(.scope == "global" or .scope == "" or .scope == null)
+            | .address
+        ' 2>/dev/null | head -n1)"
+
+        if [ -n "$addr" ] && [ "$addr" != "null" ]; then
+            log "Network '${DEFAULT_NETWORK}' is up with IPv4 address ${addr}."
+            return 0
+        fi
+        sleep 1
+    done
+
+    err "Network '${DEFAULT_NETWORK}' did not obtain an IPv4 address within ${timeout}s."
+    err "Current state:"
+    echo "$state" | jq -r '.metadata | {state: .state, addresses: .addresses}' >&2 || true
+    return 1
+}
+
+ensure_lxd_initialized() {
+    if lxd_is_initialized; then
+        log "LXD is already initialized."
+        wait_for_network_ipv4 30 || die "Managed network not ready."
+        return 0
+    fi
+
+    log "LXD is not initialized; performing automatic initialization"
+    log "(equivalent of 'lxd init --auto') ..."
+
+    create_default_pool
+    create_default_network
+    attach_devices_to_profile
+
+    if lxd_is_initialized; then
+        log "LXD initialization complete."
+    else
+        die "LXD initialization did not complete successfully."
+    fi
+
+    wait_for_network_ipv4 60 || die "Managed network did not come up."
+}
+
+# ===========================================================================
+# Container lifecycle
+# ===========================================================================
+
+container_exists() {
+    [ "$(http_code "/1.0/instances/${CONTAINER_NAME}")" = "200" ]
+}
+
+container_status() {
+    lxd_api GET "/1.0/instances/${CONTAINER_NAME}/state" \
+        | jq -r '.metadata.status // "Unknown"'
+}
+
+create_container() {
+    if container_exists; then
+        log "Container '$CONTAINER_NAME' already exists; reusing it."
+        return 0
+    fi
+
+    log "Creating container '$CONTAINER_NAME' from ${IMAGE_REMOTE}:${UBUNTU_LTS_ALIAS} ..."
+    local body resp
+    body="$(jq -n \
+        --arg name "$CONTAINER_NAME" \
+        --arg alias "$UBUNTU_LTS_ALIAS" \
+        --arg server "$IMAGE_SERVER" \
+        '{
+            name: $name,
+            source: {
+                type: "image",
+                mode: "pull",
+                protocol: "simplestreams",
+                server: $server,
+                alias: $alias
+            },
+            config: {
+                "security.nesting": "true",
+                "boot.autostart": "false"
+            }
+        }')"
+
+    resp="$(lxd_api POST "/1.0/instances" "$body")"
+    wait_for_operation "$resp" || die "Failed to create container."
+    log "Container created."
+}
+
+start_container() {
+    if [ "$(container_status)" = "Running" ]; then
+        log "Container already running."
+        return 0
+    fi
+    log "Starting container '$CONTAINER_NAME' ..."
+    local resp
+    resp="$(lxd_api PUT "/1.0/instances/${CONTAINER_NAME}/state" \
+        '{"action":"start","timeout":60}')"
+    wait_for_operation "$resp" || die "Failed to start container."
+}
+
+# ===========================================================================
+# Exec inside the container (REST exec API, record-output)
+# ===========================================================================
+
+exec_in_container() {
+    local cmd_json body resp op_path result rc out_url err_url
+    cmd_json="$(printf '%s\n' "$@" | jq -R . | jq -s .)"
+
+    body="$(jq -n --argjson command "$cmd_json" \
+        '{
+            command: $command,
+            "wait-for-websocket": false,
+            "record-output": true,
+            interactive: false,
+            environment: {
+                "DEBIAN_FRONTEND": "noninteractive",
+                "HOME": "/root",
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+            }
+        }')"
+
+    resp="$(lxd_api POST "/1.0/instances/${CONTAINER_NAME}/exec" "$body")"
+    op_path="$(echo "$resp" | jq -r '.operation')"
+    [ -n "$op_path" ] && [ "$op_path" != "null" ] \
+        || { err "exec failed to start: $(echo "$resp" | jq -c .)"; return 1; }
+
+    result="$(lxd_api GET "${op_path}/wait")"
+    rc="$(echo "$result" | jq -r '.metadata.metadata.return // -1')"
+
+    out_url="$(echo "$result" | jq -r '.metadata.metadata.output["1"] // empty')"
+    err_url="$(echo "$result" | jq -r '.metadata.metadata.output["2"] // empty')"
+    [ -n "$out_url" ] && lxd_api GET "$out_url" || true
+    [ -n "$err_url" ] && lxd_api GET "$err_url" >&2 || true
+
+    return "$rc"
+}
+
+# ===========================================================================
+# Container readiness & provisioning
+# ===========================================================================
+
+wait_for_boot() {
+    log "Waiting for container to finish booting ..."
+    local i
+    for i in $(seq 1 60); do
+        if exec_in_container true >/dev/null 2>&1; then
+            if exec_in_container test -S /run/snapd.socket >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    log "Proceeding; container may still be settling."
+}
+
+ensure_snapd() {
+    log "Ensuring snapd is installed in the container ..."
+    exec_in_container bash -c \
+        'command -v snap >/dev/null 2>&1 || (apt-get update -q && apt-get install -y snapd)'
+    exec_in_container bash -c \
+        'for i in $(seq 1 30); do [ -S /run/snapd.socket ] && break; sleep 1; done'
+}
+
+# ===========================================================================
+# Container-side connectivity probe
+# ===========================================================================
+
+probe_container_connectivity() {
+    local timeout="${1:-60}"
+    log "Probing container connectivity to ${STORE_HOST} ..."
+
+    local i resolved
+    for i in $(seq 1 "$timeout"); do
+        if exec_in_container getent hosts "$STORE_HOST" >/dev/null 2>&1; then
+            resolved="$(exec_in_container getent hosts "$STORE_HOST" 2>/dev/null \
+                        | awk '{print $1}' | head -n1)"
+            log "Container resolved ${STORE_HOST} -> ${resolved:-?}"
+            return 0
+        fi
+        sleep 1
+    done
+
+    err "Container could not resolve ${STORE_HOST} within ${timeout}s."
+    err "Diagnostics from inside the container:"
+    err "--- /etc/resolv.conf ---"
+    exec_in_container cat /etc/resolv.conf >&2 2>/dev/null || err "(unreadable)"
+    err "--- default route ---"
+    exec_in_container ip route show default >&2 2>/dev/null || err "(unreadable)"
+    err "This usually means the container has no working DNS or outbound
+       network access. Check that lxdbr0 has NAT enabled (ipv4.nat=true)."
+    return 1
+}
+
+# ===========================================================================
+# Install with idempotent fast path + retry / backoff
+# ===========================================================================
+
+snap_already_installed() {
+    local current
+    current="$(exec_in_container snap list "$SNAP_NAME" 2>/dev/null \
+                | awk 'NR==2 {print $1}')"
+    [ "$current" = "$SNAP_NAME" ]
+}
+
+_run_snap_install_once() {
+    local outfile rc
+    outfile="$(mktemp)"
+    exec_in_container snap install "$SNAP_NAME" \
+        --classic --channel "$SNAP_CHANNEL" >"$outfile" 2>&1
+    rc=$?
+    cat "$outfile" >&2
+    LAST_INSTALL_OUTPUT="$(cat "$outfile")"
+    rm -f "$outfile"
+    return "$rc"
+}
+
+_is_transient_error() {
+    local text="$1"
+
+    if echo "$text" | grep -Eqi \
+        'snap "[^"]+" not found|not found in the .* store|no snap found'; then
+        return 1
+    fi
+    if echo "$text" | grep -Eqi \
+        'requires classic confinement|not a classic|classic confinement.*not'; then
+        return 1
+    fi
+    if echo "$text" | grep -Eqi \
+        'no snap revision .* on channel|channel .* not found|invalid channel|risk .* not found'; then
+        return 1
+    fi
+    if echo "$text" | grep -Eqi 'no space left on device'; then
+        return 1
+    fi
+
+    if echo "$text" | grep -Eqi \
+        'timeout|timed out|temporary failure|temporarily unavailable|connection reset|connection refused|network is unreachable|cannot connect to the store|store .* unavailable|server error|5[0-9][0-9] |too many requests|429|change in progress|another change in progress|snapd is not ready|retry|EOF'; then
+        return 0
+    fi
+
+    return 0
+}
+
+install_snap_in_container() {
+    if snap_already_installed; then
+        log "'$SNAP_NAME' already installed in container; ensuring channel '$SNAP_CHANNEL'."
+        if exec_in_container snap refresh "$SNAP_NAME" \
+                --classic --channel "$SNAP_CHANNEL" >/dev/null 2>&1; then
+            log "'$SNAP_NAME' is on channel '$SNAP_CHANNEL'."
+            log "Installed snaps in container:"
+            exec_in_container snap list || true
+            return 0
+        fi
+        log "Refresh reported no change or failed; continuing to install path."
+    fi
+
+    log "Installing classic snap '$SNAP_NAME' (channel '$SNAP_CHANNEL') in container ..."
+
+    local attempt=1
+    local delay="$SNAP_INSTALL_BASE_DELAY"
+    LAST_INSTALL_OUTPUT=""
+
+    while [ "$attempt" -le "$SNAP_INSTALL_MAX_ATTEMPTS" ]; do
+        log "Install attempt ${attempt}/${SNAP_INSTALL_MAX_ATTEMPTS} ..."
+
+        if _run_snap_install_once; then
+            log "Successfully installed '$SNAP_NAME' in container '$CONTAINER_NAME'."
+            log "Installed snaps in container:"
+            exec_in_container snap list || true
+            return 0
+        fi
+
+        if ! _is_transient_error "$LAST_INSTALL_OUTPUT"; then
+            err "Permanent error installing '$SNAP_NAME'; not retrying."
+            die "snap install failed: $(echo "$LAST_INSTALL_OUTPUT" | tail -n3)"
+        fi
+
+        if [ "$attempt" -eq "$SNAP_INSTALL_MAX_ATTEMPTS" ]; then
+            err "Exhausted ${SNAP_INSTALL_MAX_ATTEMPTS} attempts."
+            die "snap install failed after retries: $(echo "$LAST_INSTALL_OUTPUT" | tail -n3)"
+        fi
+
+        local jitter=$(( RANDOM % 3 ))
+        local wait_s=$(( delay + jitter ))
+        [ "$wait_s" -gt "$SNAP_INSTALL_MAX_DELAY" ] && wait_s="$SNAP_INSTALL_MAX_DELAY"
+
+        log "Transient error detected; retrying in ${wait_s}s ..."
+        sleep "$wait_s"
+
+        delay=$(( delay * 2 ))
+        [ "$delay" -gt "$SNAP_INSTALL_MAX_DELAY" ] && delay="$SNAP_INSTALL_MAX_DELAY"
+        attempt=$(( attempt + 1 ))
+    done
+}
+
+# ===========================================================================
+# Main
+# ===========================================================================
+
+main() {
+    acquire_lock
+    require_socket
+    read_config
+    ensure_lxd_initialized
+    create_container
+    start_container
+    wait_for_boot
+    ensure_snapd
+    probe_container_connectivity 60 \
+        || die "Aborting before snap install: container has no store connectivity."
+    install_snap_in_container
+    log "Done."
+}
+
+main "$@"
